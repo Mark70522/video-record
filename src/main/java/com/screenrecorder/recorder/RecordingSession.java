@@ -118,9 +118,9 @@ public class RecordingSession {
                 "-draw_mouse", "1",
                 "-i", "desktop",
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "veryfast",
                 "-pix_fmt", "yuv420p",
-                "-crf", "23",
+                "-crf", "28",
                 "-f", "mpegts",
                 "-y",
                 tmpVideo.getAbsolutePath()
@@ -293,7 +293,7 @@ public class RecordingSession {
                     "-map", "0:v",
                     "-map", "[aout]",
                     "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
+                    "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
                     "-y", currentOutputPath
             );
@@ -305,7 +305,7 @@ public class RecordingSession {
                     "-ac", String.valueOf(finalAudioCh),
                     "-i",  micTmp.getAbsolutePath(),
                     "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
+                    "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
                     "-y", currentOutputPath
             );
@@ -317,7 +317,7 @@ public class RecordingSession {
                     "-ac", String.valueOf(finalAudioCh),
                     "-i",  wasapiTmp.getAbsolutePath(),
                     "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
+                    "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
                     "-y", currentOutputPath
             );
