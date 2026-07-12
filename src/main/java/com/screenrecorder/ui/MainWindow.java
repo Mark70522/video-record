@@ -219,9 +219,20 @@ public class MainWindow extends JFrame {
 
     private void onRecordButton() {
         switch (session.getState()) {
-            case IDLE      -> startRecording();
-            case RECORDING -> pauseRecording();
-            case PAUSED    -> resumeRecording();
+            case IDLE:
+                startRecording();
+                break;
+
+            case RECORDING:
+                pauseRecording();
+                break;
+
+            case PAUSED:
+                resumeRecording();
+                break;
+
+            default:
+                break;
         }
     }
 
@@ -276,14 +287,9 @@ public class MainWindow extends JFrame {
                 SwingUtilities.invokeLater(() -> {
                     resetUI();
                     if (saved != null) {
-                        int choice = JOptionPane.showConfirmDialog(this,
-                                "Recording saved!\n" + saved + "\n\nOpen folder?",
-                                "Done", JOptionPane.YES_NO_OPTION,
-                                JOptionPane.INFORMATION_MESSAGE);
-                        if (choice == JOptionPane.YES_OPTION) {
-                            try { Desktop.getDesktop().open(new File(saved).getParentFile()); }
-                            catch (Exception ignored) {}
-                        }
+                        // 录制结束自动保存,不再弹确认框;仅状态栏轻提示已保存
+                        lblStatus.setText("Saved: " + new File(saved).getName());
+                        lblStatus.setForeground(C_GREEN);
                     }
                 });
             } catch (Exception ex) {

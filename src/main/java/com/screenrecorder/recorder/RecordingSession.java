@@ -37,6 +37,7 @@ public class RecordingSession {
     private long pauseStart;
 
     private Process        ffmpegProc;
+    private OutputStream   ffmpegStdin;
     private Thread         micThread;
     private TargetDataLine micLine;
     private WasapiLoopback wasapi;
@@ -109,25 +110,36 @@ public class RecordingSession {
 
         // Launch FFmpeg: capture desktop -> MPEG-TS
         // -pix_fmt yuv420p : required for broad compatibility with H.264
-        // redirectInput(INHERIT) : keeps stdin detached so the JVM pipe does not
-        //   cause FFmpeg to exit immediately on Windows
+        // -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 : force EVEN width/height.
+        //   gdigrab "desktop" grabs the whole virtual desktop (all monitors).
+        //   With an extended/multi-monitor or DPI-scaled layout the combined
+        //   size is often an ODD number of pixels, which libx264 + yuv420p
+        //   reject -> the encoder aborts and the file is unplayable. Cropping
+        //   one row/column makes any virtual-desktop size encodable.
+        // -g 30 : a keyframe at least every ~2s keeps the file seekable and
+        //   limits how much tail is lost if FFmpeg is force-killed.
+        // stdin is left as a PIPE (default) so stop() can send 'q' for a
+        //   graceful shutdown; we never close it early (an EOF on stdin would
+        //   make FFmpeg quit immediately on Windows).
         ProcessBuilder pb = new ProcessBuilder(
                 ffmpeg(),
                 "-f", "gdigrab",
                 "-framerate", "15",
                 "-draw_mouse", "1",
                 "-i", "desktop",
+                "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-pix_fmt", "yuv420p",
                 "-crf", "28",
+                "-g", "30",
                 "-f", "mpegts",
                 "-y",
                 tmpVideo.getAbsolutePath()
         );
         pb.redirectErrorStream(true);
-        pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-        ffmpegProc = pb.start();
+        ffmpegProc  = pb.start();
+        ffmpegStdin = ffmpegProc.getOutputStream();
 
         // Collect FFmpeg log; also used to detect immediate startup failure
         StringBuilder ffmpegLog = new StringBuilder();
@@ -237,8 +249,10 @@ public class RecordingSession {
         if (wasapiOut != null) { wasapiOut.flush(); wasapiOut.close(); }
         micOut.flush(); micOut.close();
 
-        // Wait for FFmpeg to finish
-        ffmpegStopper.join(12000);
+        // Wait for FFmpeg to finish. Must outlast stopFfmpeg()'s graceful
+        // window (10s) + force-kill fallback (3s+3s) so the mux never starts
+        // while FFmpeg is still writing the TS.
+        ffmpegStopper.join(20000);
 
         if (!tmpVideo.exists() || tmpVideo.length() == 0)
             throw new RuntimeException("FFmpeg produced no video. Check FFmpeg path.");
@@ -259,15 +273,29 @@ public class RecordingSession {
     private void stopFfmpeg() {
         if (ffmpegProc == null || !ffmpegProc.isAlive()) return;
         try {
-            // TS survives a hard kill, so just force-terminate immediately
-            long pid = ffmpegProc.pid();
-            new ProcessBuilder("taskkill", "/F", "/PID", String.valueOf(pid))
-                    .redirectErrorStream(true)
-                    .start()
-                    .waitFor(3, TimeUnit.SECONDS);
-            ffmpegProc.waitFor(3, TimeUnit.SECONDS);
+            // Graceful stop: send 'q' on stdin so FFmpeg flushes the encoder,
+            // writes the buffered frames and a clean stream tail. A hard kill
+            // truncates whatever is still buffered, which grows with recording
+            // length -> longer recordings end up with a broken tail that some
+            // players refuse to open. Only force-kill if the graceful quit hangs.
+            if (ffmpegStdin != null) {
+                try {
+                    ffmpegStdin.write('q');
+                    ffmpegStdin.flush();
+                } catch (IOException ignored) {}
+            }
+            if (!ffmpegProc.waitFor(10, TimeUnit.SECONDS)) {
+                // Graceful quit timed out -> hard kill. Java 8 has no Process.pid()
+                // (that's Java 9+), so use destroyForcibly() instead of taskkill /PID.
+                // FFmpeg spawns no child processes here, so no need to kill a tree.
+                ffmpegProc.destroyForcibly();
+                ffmpegProc.waitFor(3, TimeUnit.SECONDS);
+            }
         } catch (Exception e) {
             ffmpegProc.destroyForcibly();
+        } finally {
+            try { if (ffmpegStdin != null) ffmpegStdin.close(); }
+            catch (IOException ignored) {}
         }
     }
 
@@ -295,6 +323,7 @@ public class RecordingSession {
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
+                    "-movflags", "+faststart",
                     "-y", currentOutputPath
             );
         } else if (hasMic) {
@@ -307,6 +336,7 @@ public class RecordingSession {
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
+                    "-movflags", "+faststart",
                     "-y", currentOutputPath
             );
         } else if (hasSys) {
@@ -319,6 +349,7 @@ public class RecordingSession {
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
+                    "-movflags", "+faststart",
                     "-y", currentOutputPath
             );
         } else {
@@ -328,6 +359,7 @@ public class RecordingSession {
                     "-i",  tmpVideo.getAbsolutePath(),
                     "-c:v", "copy",
                     "-an",
+                    "-movflags", "+faststart",
                     "-y", currentOutputPath
             );
         }
@@ -354,13 +386,33 @@ public class RecordingSession {
             Mixer mx = AudioSystem.getMixer(mi);
             if (mx.isLineSupported(di)) {
                 String name = mi.getName();
-                if (!name.toLowerCase().contains("primary")) return name;
+                if (!name.toLowerCase().contains("primary")) return fixDeviceName(name);
             }
         }
         for (Mixer.Info mi : AudioSystem.getMixerInfo())
             if (AudioSystem.getMixer(mi).getTargetLineInfo().length > 0)
-                return mi.getName();
+                return fixDeviceName(mi.getName());
         return null;
+    }
+
+    // Windows 下 javax.sound 返回的设备名是系统 ANSI 码页(简体中文=GBK)的字节,
+    // 被 JVM 按 Latin-1 解码 → 一串 Âó¿¸ç 之类的乱码。
+    // 仅当整串都落在 Latin-1 范围(≤0xFF)且含高位字节(>0x7F)这一乱码特征时,
+    //   按 GBK 还原;纯英文名或本就是真正 CJK 的名字保持不动,避免误伤。
+    private static String fixDeviceName(String s) {
+        if (s == null || s.isEmpty()) return s;
+        boolean hasHigh = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c > 0xFF) return s;        // 含真正的非 Latin-1 字符(如已正确的中文)→ 不动
+            if (c > 0x7F) hasHigh = true;  // 高位 Latin-1 字符 = 乱码嫌疑
+        }
+        if (!hasHigh) return s;            // 纯 ASCII → 不动
+        try {
+            return new String(s.getBytes("ISO-8859-1"), "GBK");
+        } catch (Exception e) {
+            return s;
+        }
     }
 
     // ------------------------------------------------------------------ getters
