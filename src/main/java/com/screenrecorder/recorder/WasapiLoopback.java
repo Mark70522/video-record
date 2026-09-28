@@ -4,7 +4,6 @@ import com.sun.jna.*;
 import com.sun.jna.platform.win32.*;
 import com.sun.jna.ptr.*;
 
-import java.io.OutputStream;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -67,7 +66,7 @@ public class WasapiLoopback {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean paused  = new AtomicBoolean(false);
     private Thread captureThread;
-    private OutputStream output;
+    private PcmSink output;
 
     // ------------------------------------------------------------------ init
 
@@ -140,7 +139,12 @@ public class WasapiLoopback {
 
     // ------------------------------------------------------------------ capture
 
-    public void start(OutputStream out) {
+    /**
+     * Starts capturing. The sink receives 16-bit PCM plus the wall-clock time of each packet,
+     * so it can keep the file aligned with the video even when loopback delivers nothing
+     * (Windows sends no loopback packets while no application is playing sound).
+     */
+    public void start(PcmSink out) {
         this.output = out;
         running.set(true);
         paused.set(false);
@@ -177,7 +181,7 @@ public class WasapiLoopback {
                                 : ppData.getValue().getByteArray(0, byteCount);
                         // Convert 32-bit float to 16-bit PCM if necessary
                         if (bitsPerSample == 32) buf = floatTo16(buf);
-                        output.write(buf);
+                        output.write(buf, 0, buf.length, System.currentTimeMillis());
                     }
 
                     // ReleaseBuffer  [vtable index 4]
@@ -205,7 +209,13 @@ public class WasapiLoopback {
     public void stop() {
         running.set(false);
         if (audioClient != null) call(audioClient, 11, audioClient); // Stop
-        if (captureThread != null) captureThread.interrupt();
+        if (captureThread != null) {
+            captureThread.interrupt();
+            // Wait for the capture loop to leave GetBuffer/ReleaseBuffer before the COM
+            // objects are released underneath it.
+            try { captureThread.join(2000); } catch (InterruptedException ignored) {}
+            captureThread = null;
+        }
         // Release COM objects (Release = vtable index 2)
         if (captureClient  != null) call(captureClient,  2, captureClient);
         if (audioClient    != null) call(audioClient,    2, audioClient);
